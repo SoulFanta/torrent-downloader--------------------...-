@@ -1,73 +1,58 @@
-use sha1::{Digest, Sha1};
+use std::{net::UdpSocket, time::Duration};
 
-mod bencode;
+use crate::tracker::UriFmt;
+
+mod tracker;
+
+const PROTOCOL_ID: i64 = 0x41727101980;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).expect("Не указан путь к файлу");
-    let data = std::fs::read(path).expect("Не удалось прочитать файл");
-    let root = bencode::decode(&data).expect("Не удалось декодировать bencode");
+    let uri = String::from("udp://tracker.torrent.eu.org:451/announce");
 
-    let info_raw = bencode::info_bytes(&data)?;
-    let info_hash = Sha1::digest(info_raw); // 20 байт
-    let info_hash_hex: String = info_hash.iter().map(|b| format!("{:02x}", b)).collect();
-
-    let announce = root
-        .get("announce")
-        .and_then(bencode::Value::as_str)
-        .unwrap_or("-");
-    let info = root
-        .get("info")
-        .ok_or("в файле нет секции info")
-        .expect("Ошибка при получении секции info");
-
-    let name = info
-        .get("name")
-        .and_then(bencode::Value::as_str)
-        .unwrap_or("?");
-
-    let piece_length = info
-        .get("piece length")
-        .and_then(bencode::Value::as_int)
-        .unwrap_or(0);
-    let pieces_count = info
-        .get("pieces")
-        .and_then(bencode::Value::as_bytes)
-        .map(|p| p.len() / 20) // каждый хеш SHA-1 это 20 байт
-        .unwrap_or(0);
-
-    let total: i64 = if let Some(len) = info.get("length").and_then(bencode::Value::as_int) {
-        len
-    } else {
-        info.get("files")
-            .and_then(bencode::Value::as_list)
-            .map(|files| files.iter().filter_map(|f| f.get("length")?.as_int()).sum())
-            .unwrap_or(0)
+    // Изящный вариант с let else: если парсинг не удался, сразу возвращаем ошибку
+    let Some(UriFmt::Udp { addr, path }) = tracker::parse_uri(&uri) else {
+        eprintln!("Неверный формат URI!");
+        return Err("Неверный формат URI".into());
     };
 
-    if let Some(files) = info.get("files").and_then(bencode::Value::as_list) {
-        println!("Файлы:");
-        for f in files {
-            let len = f
-                .get("length")
-                .and_then(bencode::Value::as_int)
-                .unwrap_or(0);
-            let path: Vec<&str> = f
-                .get("path")
-                .and_then(bencode::Value::as_list)
-                .map(|p| p.iter().filter_map(bencode::Value::as_str).collect())
-                .unwrap_or_default();
-            println!("  {} ({} байт)", path.join("/"), len);
-        }
-    }
+    println!("IP: {}, Порт: {}", addr.ip(), addr.port());
+    println!("Путь: /{}", path);
 
-    println!("Трекер:       {announce}");
-    println!("Имя:          {name}");
-    println!("Инфо-хеш:    {info_hash_hex}");
-    println!(
-        "Размер:       {:.2} МБ ({total} байт)",
-        total as f64 / 1_048_576.0
-    );
-    println!("Размер куска: {} КБ", piece_length / 1024);
-    println!("Кусков:       {pieces_count}");
+    // Биндимся на любой свободный локальный порт, а не на адрес трекера
+    // (UdpSocket::bind обычно принимает локальный адрес вроде "0.0.0.0:0")
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    // Теперь переменная addr доступна, так как она объявлена в начале функции
+    socket.connect(addr)?;
+
+    let action: i32 = 0;
+    let transaction_id: i32 = rand::random();
+    println!("transaction_id:  {}", transaction_id ); // [1, 2, 0, 0, 0, 1]
+
+    let mut packet: Vec<u8> = Vec::new();
+
+    packet.extend_from_slice(&PROTOCOL_ID.to_be_bytes());
+    packet.extend_from_slice(&action.to_be_bytes());
+    packet.extend_from_slice(&transaction_id.to_be_bytes());
+
+    println!("{:?}", packet); // [1, 2, 0, 0, 0, 1]
+    println!("{}", packet.len()); // 6
+
+    socket
+        .send(&packet)
+        .expect("Не получилось отправить запрос");
+
+    let mut buf: Vec<u8> = vec![0u8; 1024]; // буффер для ответа
+
+    // Время ожидания ответа 5 секунд иначе ошибка
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+    let n = socket.recv(&mut buf)?;
+    let response = &buf[..n]; 
+
+
+    println!("Получено байт: {}, данные: {:?}", n, response);
+    let connection_id = i64::from_be_bytes(response[8..16].try_into().unwrap());
+    println!("с 8 по 15 байт: {:?}", connection_id);
+
     Ok(())
 }
