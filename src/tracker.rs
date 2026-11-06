@@ -20,13 +20,15 @@
 // Connect
 
 use crate::torrent::Torrent;
+use std::io::{Read, Write};
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs, UdpSocket},
     time::Duration,
 };
-use std::io::{Read, Write};
 
 const PROTOCOL_ID: i64 = 0x41727101980;
+// tcp
+const MAX_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub enum UriFmt {
@@ -159,7 +161,11 @@ pub fn announce(
     Ok(peers)
 }
 
-pub fn handling_with_peers(peer: &SocketAddrV4, torrent: &Torrent, peer_id: &[u8; 20]) -> Result<TcpStream, Box<dyn std::error::Error>> {
+pub fn handling_with_peers(
+    peer: &SocketAddrV4,
+    torrent: &Torrent,
+    peer_id: &[u8; 20],
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect_timeout(
         &std::net::SocketAddr::V4(*peer),
         std::time::Duration::from_secs(3),
@@ -187,21 +193,42 @@ pub fn handling_with_peers(peer: &SocketAddrV4, torrent: &Torrent, peer_id: &[u8
         )
         .into());
     }
-    if &reply[1..20] != b"BitTorrent protocol"{
-      return Err(std::io::Error::new(
+    if &reply[1..20] != b"BitTorrent protocol" {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Invalid BitTorrent handshake",
         )
         .into());
     }
-    if &reply[28..48] != torrent.info_hash{
-      return Err(std::io::Error::new(
+    if &reply[28..48] != torrent.info_hash {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Invalid BitTorrent handshake",
         )
         .into());
     }
-
 
     Ok(stream)
+}
+
+pub fn read_message(
+    stream: &mut TcpStream,
+) -> Result<Option<(u8, Vec<u8>)>, Box<dyn std::error::Error>> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let length = u32::from_be_bytes(len_buf) as usize;
+
+    if length == 0 {
+        return Ok(None); // keep-alive
+    }
+    if length > MAX_SIZE {
+        return Err("Превышен лимит в 1 МБ".into());
+    }
+
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body)?;
+
+    let id = body[0];
+    let payload = body[1..].to_vec();
+    Ok(Some((id, payload)))
 }

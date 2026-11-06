@@ -1,4 +1,4 @@
-use std::net::UdpSocket;
+use std::{io::Write, net::UdpSocket};
 
 use crate::{torrent::Torrent, tracker::UriFmt};
 mod torrent;
@@ -68,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("peers: {:?}", peers);
 
-    let stream = 'peers: loop {
+    let mut stream = 'peers: loop {
         for peer in peers {
             match tracker::handling_with_peers(&peer, &t, &peer_id) {
                 Ok(stream) => break 'peers stream,
@@ -81,6 +81,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Не удалось подключиться ни к одному пиру".into());
     };
 
-    print!("stream: {:?}", stream);
+    // id	Название	Смысл
+    // 0	choke	пир не будет отдавать вам данные
+    // 1	unchoke	пир разрешил брать у него данные
+    // 2	interested	«я хочу у тебя что-то скачать» (это посылаете вы)
+    // 5	bitfield	карта кусков, которые есть у пира
+    // 6	request	«пришли мне такой-то блок»
+    // 7	piece	сам блок данных
+
+    match tracker::read_message(&mut stream)? {
+        None => println!("keep-alive"),
+        Some((id, payload)) => println!("id={id}, данных: {} байт", payload.len()),
+    }
+
+    let interested: [u8; 5] = [0, 0, 0, 1, 2];
+    stream.write_all(&interested)?;
+
+    for _ in 0..50 {
+        match tracker::read_message(&mut stream)? {
+            None => println!("keep-alive"),
+            Some((id, payload)) => {
+                println!("id={id}, данных: {} байт", payload.len());
+                if id == 1 {
+                    println!("unchoke получен");
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut request: Vec<u8> = Vec::new();
+    request.extend_from_slice(&13i32.to_be_bytes());
+    request.push(6);
+    request.extend_from_slice(&0i32.to_be_bytes());
+    request.extend_from_slice(&0i32.to_be_bytes());
+    request.extend_from_slice(&16384i32.to_be_bytes());
+    println!("17:    {}", request.len());
+
+    stream.write_all(&request)?;
+
+    for _ in 0..50 {
+        match tracker::read_message(&mut stream)? {
+            None => println!("keep-alive"),
+            Some((id, payload)) => {
+                println!("id={id}, данных: {} байт", payload.len());
+                if id == 7 && payload.len() >= 8 {
+                    println!("piece получен: {} байт", payload.len());
+                    println!("начало: {:?}", &payload[..payload.len().min(16)]);
+                    println!("len - 8: {:?}", payload.len() - 8);
+                    break;
+                }
+            }
+        }
+    }
+
+    // handshake.extend_from_slice(b"BitTorrent protocol");
+
     Ok(())
 }
