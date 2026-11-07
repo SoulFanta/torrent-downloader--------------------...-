@@ -98,4 +98,20 @@ impl Torrent {
             .map(|b| format!("{:02x}", b))
             .collect()
     }
+
+    pub fn piece_len(&self, index: u32) -> Option<usize> {
+        let count = self.pieces_count();
+        if index as usize >= count {
+            return None; // такого куска нет
+        }
+
+        let len = if index as usize == count - 1 {
+            // последний кусок: что осталось от файла
+            self.total_length - i64::from(index) * self.piece_length
+        } else {
+            self.piece_length
+        };
+
+        usize::try_from(len).ok()
+    }
 }

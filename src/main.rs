@@ -1,10 +1,14 @@
-use std::{io::Write, net::UdpSocket};
+use std::net::UdpSocket;
 
-use crate::{torrent::Torrent, tracker::UriFmt};
+use sha1::{Digest, Sha1};
+
+use crate::{peer::Peer, torrent::Torrent, tracker::UriFmt};
+mod peer;
+mod storage;
 mod torrent;
 mod tracker;
 
-// const PROTOCOL_ID: i64 = 0x41727101980;
+// const PROTOCOL_ID: i64 = 0x4 27101980;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // получаем и декодируем файл bencode
@@ -45,13 +49,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let uri = String::from("udp://tracker.torrent.eu.org:451/announce");
 
     // Изящный вариант с let else: если парсинг не удался, сразу возвращаем ошибку
-    let Some(UriFmt::Udp { addr, path }) = tracker::parse_uri(&uri) else {
+    let Some(UriFmt::Udp {
+        addr,
+        path: tracker_path,
+    }) = tracker::parse_uri(&uri)
+    else {
         eprintln!("Неверный формат URI!");
         return Err("Неверный формат URI".into());
     };
 
     println!("IP: {}, Порт: {}", addr.ip(), addr.port());
-    println!("Путь: /{}", path);
+    println!("Путь: /{}", tracker_path);
 
     // Биндимся на любой свободный локальный порт, а не на адрес трекера
     // (UdpSocket::bind обычно принимает локальный адрес вроде "0.0.0.0:0")
@@ -59,83 +67,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Теперь переменная addr доступна, так как она объявлена в начале функции
     socket.connect(addr)?;
 
-    let connection_id = tracker::connect(&socket).unwrap();
+    let connection_id = tracker::connect(&socket)?;
     // let info_hash: [u8; 20] = Sha1::digest(info_raw).into();
 
     println!("connection id: {:?}", connection_id);
 
-    let peers = tracker::announce(&socket, connection_id, &t, &peer_id).unwrap();
+    let peers = tracker::announce(&socket, connection_id, &t, &peer_id)?;
 
-    println!("peers: {:?}", peers);
+    println!("peers count: {:?}", peers.len());
 
-    let mut stream = 'peers: loop {
-        for peer in peers {
-            match tracker::handling_with_peers(&peer, &t, &peer_id) {
-                Ok(stream) => break 'peers stream,
-                Err(e) => {
-                    println!("{peer}: {e}");
-                    continue;
-                }
-            }
+    let mut storage = storage::Storage::new("ubuntu.iso", &t)?;
+
+    for index in 0..10 {
+        let len = t.piece_len(index).ok_or("нет такого куска")?;
+        let data = storage.read_piece(index, len)?;
+        let got: [u8; 20] = Sha1::digest(&data).into();
+        let a = index as usize * 20;
+        if got[..] != t.pieces[a..a + 20] {
+            println!("кусок {index} на диске не совпадает");
         }
-        return Err("Не удалось подключиться ни к одному пиру".into());
-    };
-
-    // id	Название	Смысл
-    // 0	choke	пир не будет отдавать вам данные
-    // 1	unchoke	пир разрешил брать у него данные
-    // 2	interested	«я хочу у тебя что-то скачать» (это посылаете вы)
-    // 5	bitfield	карта кусков, которые есть у пира
-    // 6	request	«пришли мне такой-то блок»
-    // 7	piece	сам блок данных
-
-    match tracker::read_message(&mut stream)? {
-        None => println!("keep-alive"),
-        Some((id, payload)) => println!("id={id}, данных: {} байт", payload.len()),
-    }
-
-    let interested: [u8; 5] = [0, 0, 0, 1, 2];
-    stream.write_all(&interested)?;
-
-    for _ in 0..50 {
-        match tracker::read_message(&mut stream)? {
-            None => println!("keep-alive"),
-            Some((id, payload)) => {
-                println!("id={id}, данных: {} байт", payload.len());
-                if id == 1 {
-                    println!("unchoke получен");
-                    break;
-                }
-            }
+        else{
+            println!("Совпало")
         }
     }
 
-    let mut request: Vec<u8> = Vec::new();
-    request.extend_from_slice(&13i32.to_be_bytes());
-    request.push(6);
-    request.extend_from_slice(&0i32.to_be_bytes());
-    request.extend_from_slice(&0i32.to_be_bytes());
-    request.extend_from_slice(&16384i32.to_be_bytes());
-    println!("17:    {}", request.len());
 
-    stream.write_all(&request)?;
+    let mut current: Option<Peer> = None;
+    let mut next_addr = 0; // с какого адреса пробовать дальше
 
-    for _ in 0..50 {
-        match tracker::read_message(&mut stream)? {
-            None => println!("keep-alive"),
-            Some((id, payload)) => {
-                println!("id={id}, данных: {} байт", payload.len());
-                if id == 7 && payload.len() >= 8 {
-                    println!("piece получен: {} байт", payload.len());
-                    println!("начало: {:?}", &payload[..payload.len().min(16)]);
-                    println!("len - 8: {:?}", payload.len() - 8);
-                    break;
+
+    for index in 0..10 as u32 {
+        let piece: Vec<u8> = loop {
+            if let Some(peer) = current.as_mut() {
+                match peer.download_piece(&t, index) {
+                    Ok(piece) => break piece,
+                    Err(e) => {
+                        println!("пир отвалился: {e}");
+                        current = None;
+                    }
+                }
+            } else {
+                if next_addr >= peers.len() {
+                    return Err("адреса пиров закончились".into());
+                }
+                let addr = &peers[next_addr];
+                next_addr += 1;
+
+                match Peer::open(addr, &t, &peer_id) {
+                    Ok(p) => current = Some(p),
+                    Err(e) => println!("{addr}: {e}"),
                 }
             }
+        };
+        storage.write_piece(index, &piece)?;
+
+        if index % 100 == 0 {
+            println!("{index}/{}", t.pieces_count());
         }
     }
-
-    // handshake.extend_from_slice(b"BitTorrent protocol");
 
     Ok(())
 }
