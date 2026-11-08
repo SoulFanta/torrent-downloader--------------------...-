@@ -114,4 +114,12 @@ impl Torrent {
 
         usize::try_from(len).ok()
     }
+
+    pub fn verify_piece(&self, index: u32, data: &[u8]) -> bool {
+    let a = index as usize * 20;
+    match self.pieces.get(a..a + 20) {
+        Some(expected) => Sha1::digest(data)[..] == *expected,
+        None => false,
+    }
+}
 }

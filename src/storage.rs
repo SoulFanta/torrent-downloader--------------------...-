@@ -1,5 +1,6 @@
 use std::{
-    fs::{File, OpenOptions}, io::{self, Read, Seek, SeekFrom, Write},
+    fs::{File, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
 };
 
 use crate::torrent::Torrent;
@@ -40,4 +41,16 @@ impl Storage {
 
         Ok(buf)
     }
+
+    pub fn already_have(&mut self, t: &Torrent, index: u32) -> io::Result<bool> {
+        let len = t
+            .piece_len(index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid piece index"))?;
+        let data = self.read_piece(index, len)?;
+        t.verify_piece(index, &data)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid piece index"))
+            .map(|_| true)
+    }
+
+   
 }

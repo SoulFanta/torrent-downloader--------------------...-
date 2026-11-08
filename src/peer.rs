@@ -1,4 +1,3 @@
-use sha1::{Digest, Sha1};
 use std::{
     io::{Read, Write},
     net::{SocketAddrV4, TcpStream},
@@ -7,6 +6,7 @@ use std::{
 use crate::torrent::Torrent;
 
 pub const MAX_SIZE: usize = 1024 * 1024;
+const BLOCK: usize = 16384;
 
 /*
 
@@ -175,26 +175,58 @@ impl Peer {
             return Err("слишком длинная часть".into());
         }
 
+        let total_blocks = piece_len.div_ceil(BLOCK); // для 256 КБ это 16
         let mut buffer = vec![0u8; piece_len];
 
-        for begin in (0..piece_len).step_by(16384) {
-            let block_len = std::cmp::min(16384, piece_len - begin);
-
+        for begin in (0..piece_len).step_by(BLOCK) {
+            let block_len = std::cmp::min(BLOCK, piece_len - begin);
             self.request_block(index, begin as u32, block_len as u32)?;
-            let data = self.read_block(index, begin as u32)?;
-            if data.len() != block_len {
-                return Err("Длинна блоков не совпадает".into());
+        }
+
+        let mut received = vec![false; total_blocks];
+        let mut got = 0;
+        let mut messages = 0;
+
+        while got < total_blocks {
+            messages += 1;
+            if messages > total_blocks * 3 + 50 {
+                return Err("пир шлёт не то, что просили".into());
             }
-            buffer[begin..begin + block_len].copy_from_slice(&data);
+
+            match self.read_message()? {
+                Some((7, payload)) => {
+                    let got_index = u32::from_be_bytes(payload[0..4].try_into()?);
+                    let begin = u32::from_be_bytes(payload[4..8].try_into()?);
+                    let data = &payload[8..];
+                    if got_index != index {
+                        continue; // блок чужого куска
+                    }
+
+                    let begin_usize = begin as usize;
+                    if begin_usize % BLOCK != 0 || begin_usize >= piece_len {
+                        return Err("пир прислал блок с неверным смещением".into());
+                    }
+                    let expected_len = std::cmp::min(BLOCK, piece_len - begin_usize);
+                    if data.len() != expected_len {
+                        return Err("пир прислал блок неверной длины".into());
+                    }
+                    let block_no = begin as usize / BLOCK;
+                    if received[block_no] {
+                        continue; // дубликат
+                    }
+
+                    buffer[begin_usize..begin_usize + data.len()].copy_from_slice(data);
+                    received[block_no] = true;
+                    got += 1;
+                }
+                Some((0, _)) => return Err("пир прислал choke".into()),
+                _ => {} // keep-alive, have и прочее пропускаем
+            }
         }
 
         // проверка хэша
-        let got: [u8; 20] = Sha1::digest(&buffer).into();
 
-        let a = index as usize * 20;
-        let expected = &t.pieces[a..a + 20];
-
-        if got[..] != *expected {
+        if !t.verify_piece(index, &buffer) {
             return Err("хэш куска не совпал".into());
         }
 
@@ -231,6 +263,16 @@ impl Peer {
         let mut peer = Peer::connect(addr, t, peer_id)?;
         peer.wait_unchoke()?;
         Ok(peer)
+    }
+
+    pub fn has_piece(&self, index: u32) -> bool {
+        let byte_index = (index / 8) as usize;
+        let bit_index = 7 - (index % 8);
+
+        match self.bitfield.get(byte_index) {
+            Some(byte) => (*byte >> bit_index) & 1 == 1,
+            None => false,
+        }
     }
 }
 
